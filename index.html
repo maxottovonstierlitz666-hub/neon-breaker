@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#070b14">
+<title>Неон-брейкер</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{width:100%;height:100%;overflow:hidden;background:#070b14;color:#eaf2ff;
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;user-select:none;-webkit-user-select:none}
+  canvas{display:block;touch-action:none}
+  #hud{position:fixed;top:0;left:0;right:0;z-index:3;display:flex;justify-content:space-between;
+    align-items:flex-start;padding:calc(10px + env(safe-area-inset-top)) 14px 0;pointer-events:none;
+    text-shadow:0 1px 8px rgba(0,0,0,.7)}
+  #hud .cell{font-size:11px;opacity:.6;letter-spacing:.6px;text-transform:uppercase}
+  #hud .val{font-size:20px;font-weight:700;line-height:1.1}
+  #hud .right{text-align:right}
+  #btns{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom));z-index:4;display:flex;gap:8px}
+  .btn{width:44px;height:44px;border-radius:14px;border:1px solid rgba(255,255,255,.16);
+    background:rgba(18,26,42,.62);color:#eaf2ff;font-size:18px;font-family:inherit;
+    display:flex;align-items:center;justify-content:center;backdrop-filter:blur(8px);
+    -webkit-backdrop-filter:blur(8px);cursor:pointer}
+  .btn:active{transform:scale(.94);background:rgba(255,255,255,.18)}
+  #msg{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:5;
+    background:rgba(4,8,16,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+    padding:24px;text-align:center}
+  #msg.on{display:flex}
+  #msg .card{max-width:340px;width:100%}
+  #msg h1{font-size:26px;font-weight:800;letter-spacing:-.4px;margin-bottom:8px}
+  #msg p{font-size:14px;line-height:1.55;opacity:.82;margin-bottom:18px}
+  #msg button{font-family:inherit;width:100%;padding:14px;border-radius:16px;border:none;font-size:15px;
+    font-weight:700;cursor:pointer;color:#04101a;background:linear-gradient(135deg,#4de3ff,#7d8bff)}
+  #msg button:active{transform:scale(.98)}
+  #msg .small{margin-top:10px;font-size:12px;opacity:.55}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud">
+  <div>
+    <div class="cell">Счёт</div><div class="val" id="score">0</div>
+    <div class="cell" style="margin-top:6px">Рекорд</div><div class="val" id="best" style="font-size:14px;opacity:.8">0</div>
+  </div>
+  <div class="right">
+    <div class="cell">Уровень</div><div class="val" id="level">1</div>
+    <div class="cell" style="margin-top:6px">Жизни</div><div class="val" id="lives">♥♥♥</div>
+  </div>
+</div>
+
+<div id="btns">
+  <div class="btn" id="bSound" title="Звук">🔊</div>
+  <div class="btn" id="bPause" title="Пауза">⏸</div>
+</div>
+
+<div id="msg" class="on">
+  <div class="card">
+    <h1 id="mTitle">Неон-брейкер</h1>
+    <p id="mText">Веди платформу пальцем или стрелками. Тап по экрану запускает мяч. Ловите бонусы: <b>W</b> — шире, <b>M</b> — мультимяч, <b>S</b> — замедление, <b>♥</b> — жизнь, <b>+</b> — очки.</p>
+    <button id="mBtn">Играть</button>
+    <div class="small" id="mSmall">Enter / тап — старт · P — пауза</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  resize();
+  window.addEventListener('resize', function () { resize(); layout(); });
+
+  /* ---------------- звук ---------------- */
+  var AC = null, soundOn = true;
+  function beep(freq, dur, type, vol) {
+    if (!soundOn) return;
+    try {
+      if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || 'sine';
+      o.frequency.value = freq;
+      g.gain.value = vol == null ? 0.06 : vol;
+      g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(); o.stop(AC.currentTime + dur);
+    } catch (e) {}
+  }
+
+  /* ---------------- состояние ---------------- */
+  var state = 'menu'; // menu | ready | play | pause | over | win
+  var score = 0, lives = 3, level = 1;
+  var best = 0;
+  try { best = parseInt(localStorage.getItem('nb_best') || '0', 10) || 0; } catch (e) { best = 0; }
+
+  var pad, balls, bricks, bonuses, particles;
+  var COLS = 6, HUD_TOP = 78;
+  var padWidthBase = 100, ballR = 7;
+
+  function layout() {
+    COLS = W < 380 ? 6 : (W < 520 ? 7 : 8);
+  }
+  layout();
+
+  /* ---------------- объекты ---------------- */
+  function newPad() {
+    padWidthBase = Math.max(78, Math.min(150, W * 0.24));
+    var pw = padWidthBase;
+    return {
+      w: pw, h: 14, base: pw,
+      x: (W - pw) / 2, y: H - Math.max(70, H * 0.09),
+      wideTimer: 0, target: null
+    };
+  }
+
+  function newBall(speed) {
+    var ang = (-60 + Math.random() * 120) * Math.PI / 180;
+    if (Math.abs(Math.cos(ang)) < 0.35) ang = ang > 0 ? 1.0 : -1.0;
+    return {
+      x: W / 2, y: pad.y - ballR - 2, r: ballR,
+      vx: Math.sin(ang) * speed, vy: -Math.abs(Math.cos(ang)) * speed,
+      stuck: true, trail: []
+    };
+  }
+
+  function levelSpeed(l) { return 330 + (l - 1) * 26; }
+
+  function buildLevel(l) {
+    var rows = Math.min(4 + Math.floor(l / 2), 8);
+    var gap = 6;
+    var leftPad = 14, rightPad = 14;
+    var bw = (W - leftPad - rightPad - gap * (COLS - 1)) / COLS;
+    var bh = Math.max(16, Math.min(24, bw * 0.42));
+    var top = HUD_TOP + 6;
+    bricks = [];
+    var palette = ['#4de3ff', '#7d8bff', '#ff6ec7', '#ffd166', '#7bf1a8', '#ff8f6b'];
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < COLS; c++) {
+        var hp = 1;
+        if (l >= 2 && r < rows - 2) hp = 2;
+        if (l >= 4 && r < Math.max(1, rows - 4)) hp = 3;
+        if (l >= 6 && r === 0) hp = 4;
+        bricks.push({
+          x: leftPad + c * (bw + gap),
+          y: top + r * (bh + gap),
+          w: bw, h: bh,
+          hp: hp, max: hp,
+          color: palette[r % palette.length],
+          bonus: Math.random() < 0.16 ? pickBonus() : null
+        });
+      }
+    }
+  }
+
+  function pickBonus() {
+    var r = Math.random();
+    if (r < 0.28) return 'wide';
+    if (r < 0.54) return 'multi';
+    if (r < 0.72) return 'slow';
+    if (r < 0.86) return 'life';
+    return 'score';
+  }
+
+  var BONUS_LABEL = { wide: 'W', multi: 'M', slow: 'S', life: '♥', score: '+' };
+  var BONUS_COLOR = { wide: '#4de3ff', multi: '#7d8bff', slow: '#7bf1a8', life: '#ff5d7a', score: '#ffd166' };
+
+  function resetGame() {
+    score = 0; lives = 3; level = 1;
+    pad = newPad();
+    bonuses = []; particles = [];
+    buildLevel(1);
+    balls = [newBall(levelSpeed(1))];
+    state = 'ready';
+    updateHUD();
+  }
+
+  function updateHUD() {
+    document.getElementById('score').textContent = score;
+    document.getElementById('best').textContent = best;
+    document.getElementById('level').textContent = level;
+    var s = '';
+    for (var i = 0; i < Math.max(0, lives); i++) s += '♥';
+    document.getElementById('lives').textContent = s || '—';
+  }
+
+  function showMsg(title, text, btn, small) {
+    document.getElementById('mTitle').textContent = title;
+    document.getElementById('mText').innerHTML = text;
+    document.getElementById('mBtn').textContent = btn;
+    document.getElementById('mSmall').textContent = small || '';
+    document.getElementById('msg').classList.add('on');
+  }
+  function hideMsg() { document.getElementById('msg').classList.remove('on'); }
+
+  /* ---------------- частицы ---------------- */
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 40 + Math.random() * 220;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        life: 0.5 + Math.random() * 0.4, t: 0, color: color, r: 1.5 + Math.random() * 2.5 });
+    }
+  }
+
+  /* ---------------- ввод ---------------- */
+  var keys = { left: false, right: false };
+
+  function movePadTo(clientX) {
+    if (!pad) return;
+    pad.target = window.innerWidth - clientX; // не важно, просто точка
+    pad.x = clientX - pad.w / 2;
+    clampPad();
+  }
+  function clampPad() {
+    if (!pad) return;
+    if (pad.x < 8) pad.x = 8;
+    if (pad.x + pad.w > W - 8) pad.x = W - 8 - pad.w;
+  }
+
+  canvas.addEventListener('mousemove', function (e) {
+    if (state === 'play' || state === 'ready') movePadTo(e.clientX);
+  });
+  canvas.addEventListener('touchmove', function (e) {
+    if (state === 'play' || state === 'ready') {
+      movePadTo(e.touches[0].clientX);
+      e.preventDefault();
+    }
+  }, { passive: false });
+  canvas.addEventListener('touchstart', function (e) {
+    if (state === 'play' || state === 'ready') {
+      movePadTo(e.touches[0].clientX);
+      launch();
+      e.preventDefault();
+    }
+  }, { passive: false });
+  canvas.addEventListener('mousedown', function () { launch(); });
+
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A' || e.key === 'ф' || e.key === 'Ф') keys.left = true;
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D' || e.key === 'в' || e.key === 'В') keys.right = true;
+    if (e.key === ' ' || e.key === 'Enter') { launch(); e.preventDefault(); }
+    if (e.key === 'p' || e.key === 'P') togglePause();
+  });
+  window.addEventListener('keyup', function (e) {
+    if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A' || e.key === 'ф' || e.key === 'Ф') keys.left = false;
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D' || e.key === 'в' || e.key === 'В') keys.right = false;
+  });
+
+  function launch() {
+    if (state === 'over' || state === 'win') { hideMsg(); resetGame(); return; }
+    if (state === 'pause') { togglePause(); return; }
+    if (state === 'ready') {
+      state = 'play';
+      for (var i = 0; i < balls.length; i++) {
+        if (balls[i].stuck) {
+          var b = balls[i];
+          var sp = Math.sqrt(b.vx * b.vx + b.vy * b.vy) || levelSpeed(level);
+          b.stuck = false;
+          b.vx = (Math.random() < 0.5 ? -1 : 1) * sp * 0.42;
+          b.vy = -Math.sqrt(Math.max(sp * sp - b.vx * b.vx, 1));
+        }
+      }
+      beep(520, 0.08, 'triangle', 0.05);
+    }
+  }
+
+  function togglePause() {
+    if (state === 'play') { state = 'pause'; showMsg('Пауза', 'Игра приостановлена.', 'Продолжить', ''); }
+    else if (state === 'pause') { closePause(); }
+  }
+  function closePause() { if (state === 'pause') { state = 'play'; hideMsg(); } }
+
+  document.getElementById('mBtn').addEventListener('click', function () {
+    if (state === 'menu') { hideMsg(); resetGame(); return; }
+    if (state === 'pause') { closePause(); return; }
+    if (state === 'over' || state === 'win') { hideMsg(); resetGame(); return; }
+    launch();
+  });
+  document.getElementById('bPause').addEventListener('click', togglePause);
+  document.getElementById('bSound').addEventListener('click', function () {
+    soundOn = !soundOn;
+    this.textContent = soundOn ? '🔊' : '🔇';
+  });
+
+  /* ---------------- физика/логика ---------------- */
+  function step(dt) {
+    if (state !== 'play' && state !== 'ready') return;
+
+    // платформа
+    if (keys.left) pad.x -= 640 * dt;
+    if (keys.right) pad.x += 640 * dt;
+    clampPad();
+
+    if (pad.wideTimer > 0) {
+      pad.wideTimer -= dt;
+      if (pad.wideTimer <= 0) { pad.w = pad.base; clampPad(); }
+    }
+
+    // мячи
+    for (var i = balls.length - 1; i >= 0; i--) {
+      var b = balls[i];
+
+      b.trail.push({ x: b.x, y: b.y });
+      if (b.trail.length > 8) b.trail.shift();
+
+      if (b.stuck) { b.x = pad.x + pad.w / 2; b.y = pad.y - b.r - 2; continue; }
+
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+
+      // стены
+      if (b.x - b.r < 6) { b.x = 6 + b.r; b.vx = Math.abs(b.vx); beep(320, 0.04, 'square', 0.03); }
+      if (b.x + b.r > W - 6) { b.x = W - 6 - b.r; b.vx = -Math.abs(b.vx); beep(320, 0.04, 'square', 0.03); }
+      if (b.y - b.r < HUD_TOP) { b.y = HUD_TOP + b.r; b.vy = Math.abs(b.vy); beep(320, 0.04, 'square', 0.03); }
+
+      // платформа
+      if (b.vy > 0 && b.y + b.r >= pad.y && b.y - b.r <= pad.y + pad.h &&
+          b.x >= pad.x - b.r && b.x <= pad.x + pad.w + b.r) {
+        var rel = (b.x - (pad.x + pad.w / 2)) / (pad.w / 2);
+        rel = Math.max(-1, Math.min(1, rel));
+        var sp = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+        var ang = rel * 1.05; // до ~60°
+        b.vx = Math.sin(ang) * sp;
+        b.vy = -Math.abs(Math.cos(ang) * sp);
+        b.y = pad.y - b.r - 0.5;
+        beep(660, 0.05, 'triangle', 0.05);
+      }
+
+      // кирпичи
+      for (var k = bricks.length - 1; k >= 0; k--) {
+        var br = bricks[k];
+        if (b.x + b.r > br.x && b.x - b.r < br.x + br.w &&
+            b.y + b.r > br.y && b.y - b.r < br.y + br.h) {
+
+          // определяем сторону отскока
+          var overlapX = Math.min(b.x + b.r - br.x, br.x + br.w - (b.x - b.r));
+          var overlapY = Math.min(b.y + b.r - br.y, br.y + br.h - (b.y - b.r));
+          if (overlapX < overlapY) { b.vx = -b.vx; b.x += (b.x < br.x + br.w / 2 ? -overlapX : overlapX); }
+          else { b.vy = -b.vy; b.y += (b.y < br.y + br.h / 2 ? -overlapY : overlapY); }
+
+          br.hp--;
+          if (br.hp <= 0) {
+            score += 10 * br.max;
+            burst(br.x + br.w / 2, br.y + br.h / 2, br.color, 10);
+            if (br.bonus) {
+              bonuses.push({ x: br.x + br.w / 2, y: br.y + br.h / 2,
+                vy: 130, type: br.bonus, t: 0 });
+            }
+            bricks.splice(k, 1);
+            beep(440 + Math.random() * 120, 0.06, 'sine', 0.045);
+          } else {
+            beep(300, 0.05, 'square', 0.04);
+          }
+          updateHUD();
+          break;
+        }
+      }
+
+      // потеря мяча
+      if (b.y - b.r > H) {
+        balls.splice(i, 1);
+        continue;
+      }
+    }
+
+    if (balls.length === 0) {
+      lives--;
+      updateHUD();
+      if (lives <= 0) {
+        if (score > best) { best = score; try { localStorage.setItem('nb_best', String(best)); } catch (e) {} }
+        updateHUD();
+        state = 'over';
+        showMsg('Игра окончена', 'Счёт: <b>' + score + '</b><br>Рекорд: ' + best, 'Ещё раз', 'Тап или Enter');
+        beep(180, 0.4, 'sawtooth', 0.07);
+      } else {
+        pad.w = pad.base; pad.wideTimer = 0;
+        balls = [newBall(levelSpeed(level))];
+        state = 'ready';
+        beep(240, 0.2, 'sine', 0.05);
+      }
+    }
+
+    // бонусы падают
+    for (var j = bonuses.length - 1; j >= 0; j--) {
+      var bo = bonuses[j];
+      bo.y += bo.vy * dt;
+      bo.t += dt;
+      if (bo.y - 12 > pad.y && bo.y - 12 < pad.y + pad.h + 12 &&
+          bo.x > pad.x - 14 && bo.x < pad.x + pad.w + 14) {
+        applyBonus(bo.type, bo.x, bo.y);
+        bonuses.splice(j, 1);
+        continue;
+      }
+      if (bo.y > H + 20) bonuses.splice(j, 1);
+    }
+
+    // частицы
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.t += dt;
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+      pt.vy += 260 * dt;
+      if (pt.t > pt.life) particles.splice(p, 1);
+    }
+
+    // уровень пройден
+    if (bricks.length === 0) {
+      level++;
+      score += 100;
+      buildLevel(level);
+      pad.w = pad.base; pad.wideTimer = 0;
+      bonuses = [];
+      balls = [newBall(levelSpeed(level))];
+      state = 'ready';
+      updateHUD();
+      showMsg('Уровень ' + level, 'Блоки сброшены. +100 очков.<br>Мяч стал быстрее.', 'Продолжить', 'Тап или Enter');
+      state = 'ready';
+      beep(720, 0.12, 'triangle', 0.06);
+    }
+  }
+
+  function applyBonus(type, x, y) {
+    beep(880, 0.09, 'sine', 0.06);
+    burst(x, y, BONUS_COLOR[type] || '#fff', 12);
+    if (type === 'wide') {
+      pad.w = Math.min(pad.base * 1.7, W - 20);
+      pad.wideTimer = 12;
+    } else if (type === 'slow') {
+      for (var i = 0; i < balls.length; i++) { balls[i].vx *= 0.78; balls[i].vy *= 0.78; }
+    } else if (type === 'life') {
+      if (lives < 9) lives++;
+    } else if (type === 'score') {
+      score += 250;
+    } else if (type === 'multi') {
+      var add = [];
+      for (var k = 0; k < balls.length && add.length < 4; k++) {
+        var b = balls[k];
+        if (b.stuck) continue;
+        for (var m = 0; m < 2; m++) {
+          var sp = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+          var a = Math.atan2(b.vy, b.vx) + (m === 0 ? 0.5 : -0.5);
+          add.push({ x: b.x, y: b.y, r: b.r, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, stuck: false, trail: [] });
+        }
+      }
+      balls = balls.concat(add);
+    }
+    updateHUD();
+  }
+
+  /* ---------------- отрисовка ---------------- */
+  function draw() {
+    // фон
+    var g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#080e1c');
+    g.addColorStop(0.55, '#0b1428');
+    g.addColorStop(1, '#050810');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // сетка
+    ctx.strokeStyle = 'rgba(90,160,255,.07)';
+    ctx.lineWidth = 1;
+    var gs = 34;
+    ctx.beginPath();
+    for (var gx = 0; gx < W; gx += gs) { ctx.moveTo(gx, 0); ctx.lineTo(gx, H); }
+    for (var gy = 0; gy < H; gy += gs) { ctx.moveTo(0, gy); ctx.lineTo(W, gy); }
+    ctx.stroke();
+
+    // кирпичи
+    for (var i = 0; i < bricks.length; i++) {
+      var b = bricks[i];
+      ctx.globalAlpha = 0.28 + 0.72 * (b.hp / b.max);
+      ctx.fillStyle = b.color;
+      ctx.shadowColor = b.color;
+      ctx.shadowBlur = 14;
+      roundRect(b.x, b.y, b.w, b.h, 5);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = 1;
+      // блик
+      ctx.fillStyle = 'rgba(255,255,255,.16)';
+      roundRect(b.x + 2, b.y + 2, b.w - 4, Math.max(3, b.h * 0.28), 3);
+      ctx.fill();
+      // отметки прочности
+      if (b.max > 1) {
+        ctx.fillStyle = 'rgba(0,0,0,.55)';
+        ctx.font = 'bold 10px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(String(b.hp), b.x + b.w / 2, b.y + b.h / 2 + 1);
+      }
+    }
+
+    // бонусы
+    for (var j = 0; j < bonuses.length; j++) {
+      var bo = bonuses[j];
+      var col = BONUS_COLOR[bo.type];
+      ctx.save();
+      ctx.translate(bo.x, bo.y);
+      ctx.rotate(Math.sin(bo.t * 3) * 0.25);
+      ctx.fillStyle = col;
+      ctx.shadowColor = col;
+      ctx.shadowBlur = 18;
+      roundRect(-13, -13, 26, 26, 8);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#04101a';
+      ctx.font = 'bold 15px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(BONUS_LABEL[bo.type], 0, 1);
+      ctx.restore();
+    }
+
+    // частицы
+    for (var p = 0; p < particles.length; p++) {
+      var pt = particles[p];
+      var a = 1 - pt.t / pt.life;
+      ctx.globalAlpha = Math.max(0, a);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // платформа
+    if (pad) {
+      var pg = ctx.createLinearGradient(pad.x, pad.y, pad.x + pad.w, pad.y + pad.h);
+      pg.addColorStop(0, '#4de3ff');
+      pg.addColorStop(1, '#7d8bff');
+      ctx.fillStyle = pg;
+      ctx.shadowColor = '#4de3ff';
+      ctx.shadowBlur = 22;
+      roundRect(pad.x, pad.y, pad.w, pad.h, 7);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      if (pad.wideTimer > 0) {
+        ctx.strokeStyle = 'rgba(255,255,255,.75)';
+        ctx.lineWidth = 2;
+        roundRect(pad.x - 2, pad.y - 2, pad.w + 4, pad.h + 4, 9);
+        ctx.stroke();
+      }
+    }
+
+    // мячи
+    for (var bi = 0; bi < balls.length; bi++) {
+      var ball = balls[bi];
+      for (var t = 0; t < ball.trail.length; t++) {
+        var tr = ball.trail[t];
+        ctx.globalAlpha = (t / ball.trail.length) * 0.35;
+        ctx.fillStyle = '#9fe9ff';
+        ctx.beginPath();
+        ctx.arc(tr.x, tr.y, ball.r * (0.5 + 0.5 * t / ball.trail.length), 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#fff';
+      ctx.shadowColor = '#7d8bff';
+      ctx.shadowBlur = 20;
+      ctx.beginPath();
+      ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // подсказка при готовности
+    if (state === 'ready') {
+      ctx.fillStyle = 'rgba(230,240,255,.75)';
+      ctx.font = '600 13px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('Тап по экрану — запустить мяч', W / 2, pad.y - 34);
+    }
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    if (ctx.roundRect) { ctx.roundRect(x, y, w, h, r); return; }
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  /* ---------------- цикл ---------------- */
+  var last = 0;
+  function frame(ts) {
+    if (!last) last = ts;
+    var dt = Math.min((ts - last) / 1000, 0.033);
+    last = ts;
+    step(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  resetGame();
+  state = 'menu';
+  updateHUD();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
